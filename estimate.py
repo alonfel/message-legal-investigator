@@ -26,8 +26,8 @@ CHUNK_MAX_OUT_TOK   = 32_000    # max_tokens for chunk calls (3-page chunk alrea
 AGG_MAX_OUT_TOK     = 32_000    # max_tokens for aggregate calls
 CHARS_PER_TOKEN     = 2         # Hebrew text ~2 chars/token
 OUTPUT_TOK_PER_MIN  = 2_750     # measured: 3,781 tok in 83s = 2,733 tok/min (Sonnet 4.6)
-PRICE_IN            = 3.00      # $ per million input tokens
-PRICE_OUT           = 15.00     # $ per million output tokens
+PRICE_IN            = 0.80      # $ per million input tokens (Haiku 4.5)
+PRICE_OUT           = 4.00      # $ per million output tokens (Haiku 4.5)
 
 
 # ─── Estimation logic ─────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ def fmt_time(minutes: float) -> str:
 def print_table(rows: list[dict], chunk_size: int, max_pages: int | None) -> None:
     mode = f"max {max_pages} pages/pdf" if max_pages else "full run"
     print(f"\n  Run Estimate — chunk: {chunk_size} pages  mode: {mode}")
-    print(f"  Pricing: Sonnet 4.6  in=$3/M  out=$15/M  output speed ~{OUTPUT_TOK_PER_MIN:,} tok/min\n")
+    print(f"  Pricing: Haiku 4.5  in=$0.80/M  out=$4/M  output speed ~{OUTPUT_TOK_PER_MIN:,} tok/min\n")
 
     W = {"name": 16, "pages": 8, "chunks": 7, "calls": 6, "in": 9, "out": 9, "time": 9, "cost": 9}
     sep = "  " + "─" * (sum(W.values()) + len(W) * 3 + 1)

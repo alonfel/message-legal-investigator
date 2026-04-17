@@ -30,10 +30,11 @@ python3 validate.py -p 10              # deeper spot-check
 # 2. Extract PDFs to plain text (one-time, speeds up all subsequent runs)
 python3 extract_pdfs.py
 
-# 3. Phase 1 — analyze each PDF in 50-page chunks, saves per-PDF results
+# 3. Phase 1 — analyze each PDF in 5-page chunks, saves per-PDF results
 python3 analyze_phase1.py                         # all 7 PDFs
 python3 analyze_phase1.py 0                       # single PDF (index 0)
 python3 analyze_phase1.py -c 3 -p 9 0             # fast validation: 3-page chunks, first 9 pages
+python3 analyze_phase1.py --file extracted/test.txt  # single pre-extracted text file
 
 # 4. Phase 2 — merge all per-PDF results into final_report.txt
 python3 analyze_phase2.py
@@ -45,13 +46,14 @@ Monitor progress live: `tail -f run.log`
 
 **Two-pass pipeline** (`analyze_phase1.py` → `analyze_phase2.py`):
 
-1. **Phase 1**: Each PDF is split into N-page chunks (default 50). Each chunk is sent to `claude-sonnet-4-6` with all 54 investigation items. When a PDF has multiple chunks, a second aggregation call merges them. All intermediate results are cached to `results/chunks/pdf_{i}_chunk_{j}.txt` and `results/pdf_{i}.txt` — rerunning skips completed work automatically. `--max-pages` disables the cache (validation mode).
+1. **Phase 1**: Each PDF is split into N-page chunks (default 5). Each chunk is sent to `claude-haiku-4-5` with all 54 investigation items. When a PDF has multiple chunks, a second aggregation call merges them. All intermediate results are cached to `results/chunks/pdf_{i}_chunk_{j}.txt` and `results/pdf_{i}.txt` — rerunning skips completed work automatically. `--max-pages` disables the cache (validation mode). Plain-text files can also be passed via `--file`.
 
 2. **Phase 2**: Reads the 7 `results/pdf_{i}.txt` files and sends them in one merged call to produce `results/final_report.txt`, deduplicating citations across PDFs.
 
 **Shared utilities** (`analysis_utils.py`):
 - `extract_text()` — serves text from `extracted/*.txt` pre-extracted files (fast), falls back to live PyMuPDF extraction. Each page is wrapped with `=== [yoni-meitalN.pdf | עמוד NN] ===` for source tracing.
-- `call_claude()` / `call_claude_streaming()` — both route to the same non-streaming call; the streaming alias exists for backwards compatibility.
+- `call_claude()` — non-streaming API call, suitable for short outputs.
+- `call_claude_streaming()` — streaming API call used for chunk/aggregate calls where output may be large (avoids SDK timeout).
 - `RunMetrics` — global `metrics` singleton accumulates token counts and cost across all API calls in a run. Reset with `reset_metrics()` at script start.
 - `log()` — writes timestamped lines to both stdout and `run.log`.
 
@@ -68,8 +70,10 @@ Monitor progress live: `tail -f run.log`
 | File | Description |
 |---|---|
 | `extracted/yoni-meitalN.txt` | Pre-extracted PDF text with page markers |
-| `results/chunks/pdf_{i}_chunk_{j}.txt` | Per-chunk raw findings |
+| `results/chunks/pdf_{i}_chunk_{j}.txt` | Per-chunk raw findings (PDF inputs) |
+| `results/chunks/file_{stem}_chunk_{j}.txt` | Per-chunk raw findings (--file inputs) |
 | `results/pdf_{i}.txt` | Aggregated findings for PDF i |
+| `results/file_{stem}.txt` | Aggregated findings for a --file input |
 | `results/report_YYYYMMDD_HHMMSS.txt` | Timestamped Phase 1 report |
 | `results/validation_YYYYMMDD_HHMMSS.txt` | Output from `validate.py` runs |
 | `results/quick_YYYYMMDD_HHMMSS.txt` | Output from `validate_quick.py` runs |
@@ -78,4 +82,4 @@ Monitor progress live: `tail -f run.log`
 
 ## Model and cost
 
-All analysis uses `claude-sonnet-4-6`. Pricing constants in `analysis_utils.py`: `$3.00/M` input, `$15.00/M` output. Cost is tracked per-call and displayed in the run summary. Claude output speed (~5,000 tok/min) is the bottleneck — each chunk call can take up to ~3m, each aggregate call up to ~6m.
+All analysis uses `claude-haiku-4-5-20251001`. Pricing constants in `analysis_utils.py`: `$0.80/M` input, `$4.00/M` output. Cost is tracked per-call and displayed in the run summary. Claude output speed (~2,750 tok/min measured) is the bottleneck — each chunk call can take up to ~12m, each aggregate call up to ~12m.
