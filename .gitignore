@@ -1,0 +1,18 @@
+# Sensitive data
+yoni-meital*.pdf
+extracted/
+results/
+keys/
+run.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
