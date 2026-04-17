@@ -15,24 +15,20 @@ EXTRACTED_DIR = BASE_DIR / "extracted"  # pre-extracted plain-text files
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """אתה מומחה לניתוח טקסטים וזיהוי דפוסי התנהגות. תפקידך לנתח תכתובות ווטסאפ ולאתר ממצאים ספציפיים.
+SYSTEM_PROMPT = """אתה מומחה לניתוח תכתובות ווטסאפ לצורך חקירה משפטית.
 
-חוקי ברזל:
-1. התבסס אך ורק על הכתוב בטקסט. אל תמציא, אל תשער ואל תשלים פערים.
-2. עבור כל ממצא — ספק ציטוט מדויק מילה במילה, עם תאריך ושעה מדויקים.
-3. לפני כל ציטוט — נתח את ההקשר וודא שהוא משקף את כוונת הסעיף ולא נאמר בציניות או בהקשר הפוך.
-4. אם לא מצאת עדות — כתוב במפורש: "לא נמצאה עדות מפורשת בטקסט".
-5. עבוד בצורה שיטתית, סעיף אחר סעיף. השתמש בלשון ישירה ועובדתית.
+כללים:
+1. התבסס אך ורק על הכתוב בטקסט. אל תמציא.
+2. דווח רק על ממצאים בולטים וחד-משמעיים — לא על כל סעיף.
+3. וודא שהציטוט משקף את כוונת הסעיף ולא נאמר בציניות או בהקשר הפוך.
+4. היה תמציתי מאוד. פחות זה יותר.
 
-פורמט חובה לכל ממצא:
-• ציטוט: "...הטקסט המדויק..."
-  תאריך ושעה: DD.MM.YYYY, HH:MM
-  מקור: yoni-meitalN.pdf, עמוד NN
-  הקשר: [משפט קצר המסביר את ההקשר]
+פורמט לכל ממצא (שורה אחת):
+סעיף N | ציטוט: "טקסט מדויק" | תאריך: DD.MM.YYYY HH:MM | מקור: קובץ עמוד NN
 
-שים לב: בתוך הטקסט ישנם סמנים בפורמט === [yoni-meitalN.pdf | עמוד NN] === — אלה מציינים את שם הקובץ ומספר העמוד של הטקסט שמגיע אחריהם. יש לכלול מידע זה בשדה "מקור" של כל ממצא."""
-
-INVESTIGATION_ITEMS = """להלן 54 הסעיפים לחקירה. עבור כל סעיף — ספק את כל הממצאים הרלוונטיים מהטקסט המצורף.
+סמנים בטקסט: === [yoni-meitalN.pdf | עמוד NN] === מציינים שם קובץ ועמוד — השתמש בהם בשדה "מקור"."""
+INVESTIGATION_ITEMS = """  עלהלן 54 הסעיפים לחקירה. עבור כל סעיף — ספק את כל הממצאים הרלוונטיים מהטקסט המצורף.
+נרצה לחסוך בtokens על כן על כל קלט שאתה מקבל תחזיר רק מעט תשובות לא על כל הסעיפים רק את אלו הבולטים ביותר, תשמור על תוצאה קצרה
 
 1. חומרים שמעידים שמיטל הורידה את שכר הדירה על דעת עצמה מ-5,000 ש"ח ל-3,500 וללא דיאלוג.
 2. עדויות שיונתן מנסה להגיע לעמק השווה ומחפש צדק, ומיטל לא מסכימה.
@@ -170,9 +166,11 @@ def extract_text(pdf_path: Path, start_page: int = 0, end_page: int | None = Non
 
 LOG_FILE = BASE_DIR / "run.log"
 
-# Pricing for claude-sonnet-4-6 ($ per million tokens)
-_PRICE_INPUT_PER_M  = 3.00
-_PRICE_OUTPUT_PER_M = 15.00
+MODEL = "claude-haiku-4-5-20251001"
+
+# Pricing for claude-haiku-4-5 ($ per million tokens)
+_PRICE_INPUT_PER_M  = 0.80
+_PRICE_OUTPUT_PER_M = 4.00
 
 # ─── Run-level metrics accumulator ───────────────────────────────────────────
 
@@ -300,7 +298,7 @@ def call_claude(
 
     t0 = time.monotonic()
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODEL,
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": user_message}],
@@ -319,7 +317,6 @@ def call_claude(
     return result
 
 
-# Keep alias so existing callers still work — routes to non-streaming call
 def call_claude_streaming(
     client: anthropic.Anthropic,
     system: str,
@@ -327,4 +324,33 @@ def call_claude_streaming(
     max_tokens: int = 4096,
     label: str = "",
 ) -> str:
-    return call_claude(client, system, user_message, max_tokens=max_tokens, label=label)
+    """Streaming API call — required when max_tokens may exceed the 10-minute SDK timeout threshold."""
+    input_chars = len(system) + len(user_message)
+    preview = user_message[:120].replace("\n", " ").strip()
+    log(f"API call{' [' + label + ']' if label else ''} — {input_chars:,} chars (~{input_chars//2:,} tok est.)")
+    log(f"  → preview: \"{preview}...\"")
+    log(f"  → max_tokens: {max_tokens}")
+
+    t0 = time.monotonic()
+    chunks: list[str] = []
+    with client.messages.stream(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_message}],
+    ) as stream:
+        for text in stream.text_stream:
+            chunks.append(text)
+        final = stream.get_final_message()
+    elapsed = time.monotonic() - t0
+
+    in_tok  = final.usage.input_tokens
+    out_tok = final.usage.output_tokens
+    call_cost = (in_tok / 1_000_000 * _PRICE_INPUT_PER_M +
+                 out_tok / 1_000_000 * _PRICE_OUTPUT_PER_M)
+    metrics.record(in_tok, out_tok, elapsed, label=label)
+
+    result = "".join(chunks)
+    log(f"  ✓ {elapsed:.1f}s — in:{in_tok:,} out:{out_tok:,} tok  ${call_cost:.4f}  stop={final.stop_reason}")
+    log(metrics.running_total_line())
+    return result

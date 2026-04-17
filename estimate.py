@@ -20,12 +20,12 @@ from analysis_utils import PDF_FILES, EXTRACTED_DIR, _slice_pages, _PAGE_MARKER_
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_CHUNK_SIZE = 50
+DEFAULT_CHUNK_SIZE = 5
 PROMPT_OVERHEAD_TOK = 5_000     # fixed system prompt + investigation items per call
-CHUNK_MAX_OUT_TOK   = 16_000    # max_tokens for chunk calls
+CHUNK_MAX_OUT_TOK   = 32_000    # max_tokens for chunk calls (3-page chunk already hit 12K; 5 pages needs ~20K)
 AGG_MAX_OUT_TOK     = 32_000    # max_tokens for aggregate calls
 CHARS_PER_TOKEN     = 2         # Hebrew text ~2 chars/token
-OUTPUT_TOK_PER_MIN  = 5_000     # measured Claude Sonnet 4.6 output rate
+OUTPUT_TOK_PER_MIN  = 2_750     # measured: 3,781 tok in 83s = 2,733 tok/min (Sonnet 4.6)
 PRICE_IN            = 3.00      # $ per million input tokens
 PRICE_OUT           = 15.00     # $ per million output tokens
 
