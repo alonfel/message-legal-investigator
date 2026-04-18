@@ -16,16 +16,17 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from analysis_utils import PDF_FILES, EXTRACTED_DIR, _slice_pages, _PAGE_MARKER_RE, count_pages
+import analysis_utils
+from analysis_utils import _slice_pages, _PAGE_MARKER_RE, count_pages
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_CHUNK_SIZE = 5
+DEFAULT_CHUNK_SIZE  = 5
 PROMPT_OVERHEAD_TOK = 5_000     # fixed system prompt + investigation items per call
-CHUNK_MAX_OUT_TOK   = 32_000    # max_tokens for chunk calls (3-page chunk already hit 12K; 5 pages needs ~20K)
-AGG_MAX_OUT_TOK     = 32_000    # max_tokens for aggregate calls
+CHUNK_AVG_OUT_TOK   = 1_300     # measured avg: 1,257 tok across 141 chunk calls (p95: 1,608)
+AGG_AVG_OUT_TOK     = 8_300     # measured avg: 8,271 tok across 5 aggregation calls
 CHARS_PER_TOKEN     = 2         # Hebrew text ~2 chars/token
-OUTPUT_TOK_PER_MIN  = 2_750     # measured: 3,781 tok in 83s = 2,733 tok/min (Sonnet 4.6)
+OUTPUT_TOK_PER_MIN  = 3_200     # measured: ~3,225 tok/min on Haiku 4.5 (avg 1,257 out in 23.4s)
 PRICE_IN            = 0.80      # $ per million input tokens (Haiku 4.5)
 PRICE_OUT           = 4.00      # $ per million output tokens (Haiku 4.5)
 
@@ -33,7 +34,7 @@ PRICE_OUT           = 4.00      # $ per million output tokens (Haiku 4.5)
 # ─── Estimation logic ─────────────────────────────────────────────────────────
 
 def estimate_pdf(pdf_path: Path, chunk_size: int, max_pages: int | None) -> dict:
-    txt = EXTRACTED_DIR / f"{pdf_path.stem}.txt"
+    txt = analysis_utils.EXTRACTED_DIR / f"{pdf_path.stem}.txt"
     if not txt.exists():
         return {"error": f"No extracted txt — run: python3 extract_pdfs.py"}
 
@@ -50,11 +51,11 @@ def estimate_pdf(pdf_path: Path, chunk_size: int, max_pages: int | None) -> dict
         chunk_text = _slice_pages(full_text, start, end)
         chunk_in_tok += len(chunk_text) // CHARS_PER_TOKEN + PROMPT_OVERHEAD_TOK
 
-    # Output tokens: bounded by max_tokens, assume full utilisation for worst-case
-    chunk_out_tok = num_chunks * CHUNK_MAX_OUT_TOK
+    # Output tokens: based on measured averages from real runs
+    chunk_out_tok = num_chunks * CHUNK_AVG_OUT_TOK
     agg_calls = 1 if num_chunks > 1 else 0
     agg_in_tok = chunk_out_tok + PROMPT_OVERHEAD_TOK if agg_calls else 0
-    agg_out_tok = AGG_MAX_OUT_TOK if agg_calls else 0
+    agg_out_tok = AGG_AVG_OUT_TOK if agg_calls else 0
 
     total_in  = chunk_in_tok + agg_in_tok
     total_out = chunk_out_tok + agg_out_tok
@@ -120,12 +121,12 @@ def print_table(rows: list[dict], chunk_size: int, max_pages: int | None) -> Non
           f" {fmt_time(tot_min):>{W['time']}} │ ${tot_cost:>{W['cost']-1}.3f}")
     print(sep)
 
-    print(f"\n  Bottleneck: Claude output speed (~{OUTPUT_TOK_PER_MIN:,} tok/min).")
-    print(f"  Each chunk call:     ~{fmt_time(CHUNK_MAX_OUT_TOK/OUTPUT_TOK_PER_MIN)} "
-          f"({CHUNK_MAX_OUT_TOK:,} tok output max)")
-    print(f"  Each aggregate call: ~{fmt_time(AGG_MAX_OUT_TOK/OUTPUT_TOK_PER_MIN)} "
-          f"({AGG_MAX_OUT_TOK:,} tok output max)")
-    print(f"  Estimates assume worst-case (full max_tokens used per call).\n")
+    print(f"\n  Bottleneck: Claude output speed (~{OUTPUT_TOK_PER_MIN:,} tok/min, measured on Haiku 4.5).")
+    print(f"  Each chunk call:     ~{fmt_time(CHUNK_AVG_OUT_TOK/OUTPUT_TOK_PER_MIN)} "
+          f"(avg {CHUNK_AVG_OUT_TOK:,} tok output, p95: 1,608)")
+    print(f"  Each aggregate call: ~{fmt_time(AGG_AVG_OUT_TOK/OUTPUT_TOK_PER_MIN)} "
+          f"(avg {AGG_AVG_OUT_TOK:,} tok output)")
+    print(f"  Estimates based on measured averages from 141 chunk + 5 agg real calls.\n")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -138,15 +139,21 @@ def main():
                         help=f"Pages per chunk (default: {DEFAULT_CHUNK_SIZE}).")
     parser.add_argument("-p", "--max-pages", type=int, default=None, metavar="N",
                         help="Cap pages per PDF (mirrors analyze_phase1.py -p flag).")
+    parser.add_argument("--input-dir", default=None, metavar="DIR",
+                        help="Folder containing input PDFs and extracted/ subdir (default: script dir).")
+    parser.add_argument("--project-dir", default=None, metavar="DIR",
+                        help="Folder for all outputs (default: <script-dir>/results).")
     args = parser.parse_args()
 
-    indices = args.pdfs if args.pdfs else list(range(len(PDF_FILES)))
-    invalid = [i for i in indices if i < 0 or i >= len(PDF_FILES)]
+    analysis_utils.configure_paths(args.input_dir, args.project_dir)
+
+    indices = args.pdfs if args.pdfs else list(range(len(analysis_utils.PDF_FILES)))
+    invalid = [i for i in indices if i < 0 or i >= len(analysis_utils.PDF_FILES)]
     if invalid:
-        print(f"Invalid PDF indices: {invalid}. Valid: 0–{len(PDF_FILES)-1}", file=sys.stderr)
+        print(f"Invalid PDF indices: {invalid}. Valid: 0–{len(analysis_utils.PDF_FILES)-1}", file=sys.stderr)
         sys.exit(1)
 
-    rows = [estimate_pdf(PDF_FILES[i], args.chunk_size, args.max_pages) for i in indices]
+    rows = [estimate_pdf(analysis_utils.PDF_FILES[i], args.chunk_size, args.max_pages) for i in indices]
     print_table(rows, args.chunk_size, args.max_pages)
 
 

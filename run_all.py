@@ -14,23 +14,24 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import datetime
 import json
 import math
 import os
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import anthropic
+import analysis_utils
 from analysis_utils import (
-    PDF_FILES, RESULTS_DIR, CHUNKS_DIR, SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
     call_claude_streaming, log, metrics, reset_metrics, count_pages,
 )
 from analyze_phase1 import process_chunk, aggregate_chunks, DEFAULT_BATCH_SIZE
-
-PROGRESS_FILE = RESULTS_DIR / "progress.json"
 
 
 # ─── Progress Tracker ────────────────────────────────────────────────────────
@@ -39,10 +40,15 @@ class ProgressTracker:
     def __init__(self, chunk_size: int) -> None:
         self.chunk_size = chunk_size
         self._data: dict = {}
+        self._lock = threading.Lock()
+
+    @property
+    def _progress_file(self) -> Path:
+        return analysis_utils.RESULTS_DIR / "progress.json"
 
     def load(self) -> None:
-        if PROGRESS_FILE.exists():
-            self._data = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        if self._progress_file.exists():
+            self._data = json.loads(self._progress_file.read_text(encoding="utf-8"))
             self._data["chunk_size"] = self.chunk_size
         else:
             now = datetime.datetime.now().isoformat(timespec="seconds")
@@ -59,7 +65,7 @@ class ProgressTracker:
                         "aggregated": False,
                         "completed_at": None,
                     }
-                    for i in range(len(PDF_FILES))
+                    for i in range(len(analysis_utils.PDF_FILES))
                 },
                 "phase2": {"status": "pending", "completed_at": None},
             }
@@ -68,7 +74,7 @@ class ProgressTracker:
     def reconcile(self) -> None:
         """Sync progress.json with actual files on disk."""
         changed = False
-        for i in range(len(PDF_FILES)):
+        for i in range(len(analysis_utils.PDF_FILES)):
             key = str(i)
             entry = self._data["pdfs"].setdefault(key, {
                 "status": "pending", "total_chunks": None,
@@ -77,7 +83,7 @@ class ProgressTracker:
 
             # Discover completed chunks from existing files
             existing = set(entry.get("chunks_done") or [])
-            for f in CHUNKS_DIR.glob(f"pdf_{i}_chunk_*.txt"):
+            for f in analysis_utils.CHUNKS_DIR.glob(f"pdf_{i}_chunk_*.txt"):
                 try:
                     idx = int(f.stem.split("_chunk_")[1])
                     existing.add(idx)
@@ -88,14 +94,14 @@ class ProgressTracker:
                 changed = True
 
             # Compute total_chunks from extracted text (instant — no PDF open)
-            total_pages = count_pages(PDF_FILES[i])
+            total_pages = count_pages(analysis_utils.PDF_FILES[i])
             total_chunks = math.ceil(total_pages / self.chunk_size)
             if entry.get("total_chunks") != total_chunks:
                 entry["total_chunks"] = total_chunks
                 changed = True
 
             # Aggregated PDF result
-            pdf_result = RESULTS_DIR / f"pdf_{i}.txt"
+            pdf_result = analysis_utils.RESULTS_DIR / f"pdf_{i}.txt"
             if pdf_result.exists() and not entry.get("aggregated"):
                 entry["aggregated"] = True
                 entry["status"] = "done"
@@ -107,7 +113,7 @@ class ProgressTracker:
                 changed = True
 
         # Phase 2
-        final_report = RESULTS_DIR / "final_report.txt"
+        final_report = analysis_utils.RESULTS_DIR / "final_report.txt"
         if final_report.exists() and self._data["phase2"]["status"] != "done":
             self._data["phase2"]["status"] = "done"
             changed = True
@@ -122,11 +128,12 @@ class ProgressTracker:
         self._save()
 
     def mark_chunk_done(self, i: int, chunk_idx: int) -> None:
-        entry = self._data["pdfs"][str(i)]
-        done = set(entry["chunks_done"])
-        done.add(chunk_idx)
-        entry["chunks_done"] = sorted(done)
-        self._save()
+        with self._lock:
+            entry = self._data["pdfs"][str(i)]
+            done = set(entry["chunks_done"])
+            done.add(chunk_idx)
+            entry["chunks_done"] = sorted(done)
+            self._save()
 
     def mark_pdf_aggregated(self, i: int) -> None:
         entry = self._data["pdfs"][str(i)]
@@ -157,7 +164,7 @@ class ProgressTracker:
         sep = "─" * 62
         print(f"\nPipeline status  (chunk_size={self.chunk_size})")
         print(sep)
-        for i in range(len(PDF_FILES)):
+        for i in range(len(analysis_utils.PDF_FILES)):
             entry = self._data["pdfs"][str(i)]
             status = entry.get("status", "pending")
             done_n = len(entry.get("chunks_done") or [])
@@ -166,7 +173,7 @@ class ProgressTracker:
             ts = entry.get("completed_at") or "—"
             if ts and ts != "—":
                 ts = ts[:16].replace("T", " ")
-            name = PDF_FILES[i].name
+            name = analysis_utils.PDF_FILES[i].name
             status_icon = {"done": "✓", "running": "→", "pending": " "}.get(status, " ")
             print(f"  {status_icon} PDF {i}  {name:<22}  {status:<8}  {chunk_str:>7} chunks  {ts}")
 
@@ -178,24 +185,24 @@ class ProgressTracker:
         p2_icon = {"done": "✓", "running": "→", "pending": " "}.get(p2_status, " ")
         print(f"  {p2_icon} Phase 2 (merge)              {p2_status:<8}  {'':>15}  {p2_ts}")
 
-        done_count = sum(1 for i in range(len(PDF_FILES))
+        done_count = sum(1 for i in range(len(analysis_utils.PDF_FILES))
                          if self._data["pdfs"][str(i)].get("aggregated"))
         print(sep)
-        print(f"  Done: {done_count}/{len(PDF_FILES)} PDFs   Phase 2: {p2_status}\n")
+        print(f"  Done: {done_count}/{len(analysis_utils.PDF_FILES)} PDFs   Phase 2: {p2_status}\n")
 
     def _save(self) -> None:
         self._data["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
-        tmp = PROGRESS_FILE.with_suffix(".json.tmp")
+        tmp = self._progress_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(PROGRESS_FILE)
+        tmp.replace(self._progress_file)
 
 
 # ─── Phase 2 merge (no argparse/input/reset_metrics) ─────────────────────────
 
 def _run_phase2(client: anthropic.Anthropic) -> None:
-    final_path = RESULTS_DIR / "final_report.txt"
-    available = [(i, RESULTS_DIR / f"pdf_{i}.txt") for i in range(len(PDF_FILES))
-                 if (RESULTS_DIR / f"pdf_{i}.txt").exists()]
+    final_path = analysis_utils.RESULTS_DIR / "final_report.txt"
+    available = [(i, analysis_utils.RESULTS_DIR / f"pdf_{i}.txt") for i in range(len(analysis_utils.PDF_FILES))
+                 if (analysis_utils.RESULTS_DIR / f"pdf_{i}.txt").exists()]
 
     if not available:
         log("Phase 2: no per-PDF result files found — skipping")
@@ -268,15 +275,28 @@ def main() -> None:
         help=f"Pages per chunk (default: {DEFAULT_BATCH_SIZE}).",
     )
     parser.add_argument(
+        "-w", "--workers", type=int, default=2, metavar="N",
+        help="Parallel chunk workers per PDF (default: 2, max: 10).",
+    )
+    parser.add_argument(
         "--status", action="store_true",
         help="Print progress and exit without running anything.",
     )
+    parser.add_argument(
+        "--input-dir", default=None, metavar="DIR",
+        help="Folder containing input PDFs and extracted/ subdir (default: script dir).",
+    )
+    parser.add_argument(
+        "--project-dir", default=None, metavar="DIR",
+        help="Folder for all outputs: chunks, results, run.log (default: <script-dir>/results).",
+    )
     args = parser.parse_args()
 
+    analysis_utils.configure_paths(args.input_dir, args.project_dir)
     tracker = ProgressTracker(chunk_size=args.chunk_size)
 
     if args.status:
-        if RESULTS_DIR.exists():
+        if analysis_utils.RESULTS_DIR.exists():
             tracker.load()
         else:
             # Build in-memory default without saving (nothing exists yet)
@@ -285,7 +305,7 @@ def main() -> None:
                 "pdfs": {
                     str(i): {"status": "pending", "total_chunks": None,
                               "chunks_done": [], "aggregated": False, "completed_at": None}
-                    for i in range(len(PDF_FILES))
+                    for i in range(len(analysis_utils.PDF_FILES))
                 },
                 "phase2": {"status": "pending", "completed_at": None},
             }
@@ -298,18 +318,19 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    CHUNKS_DIR.mkdir(exist_ok=True)
+    analysis_utils.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    analysis_utils.CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
     tracker.load()
     tracker.print_status()
 
     reset_metrics()
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=anthropic.Timeout(connect=30.0, read=1800.0, write=30.0, pool=30.0))
     chunk_size = args.chunk_size
+    workers = min(max(1, args.workers), 10)
 
-    for i in range(len(PDF_FILES)):
-        pdf_path = PDF_FILES[i]
+    for i in range(len(analysis_utils.PDF_FILES)):
+        pdf_path = analysis_utils.PDF_FILES[i]
 
         if tracker.is_pdf_aggregated(i):
             log(f"[PDF {i}] skipped — pdf_{i}.txt already exists")
@@ -325,22 +346,24 @@ def main() -> None:
 
         tracker.init_pdf(i, num_chunks)
 
-        for chunk_idx in range(num_chunks):
-            if tracker.is_chunk_done(i, chunk_idx):
-                start = chunk_idx * chunk_size
-                end = min(start + chunk_size, total_pages)
-                log(f"  [skip] chunk {chunk_idx} (pages {start+1}–{end}) — already done")
-                continue
-
+        def _run_chunk(chunk_idx: int) -> None:
             start = chunk_idx * chunk_size
             end = min(start + chunk_size, total_pages)
+            if tracker.is_chunk_done(i, chunk_idx):
+                log(f"  [skip] chunk {chunk_idx} (pages {start+1}–{end}) — already done")
+                return
             process_chunk(client, pdf_path, i, chunk_idx, start, end, total_pages,
                           skip_cache=False)
             tracker.mark_chunk_done(i, chunk_idx)
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_chunk, c) for c in range(num_chunks)]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()  # re-raise any exception
+
         # All chunks done — aggregate
         chunk_results = [
-            (CHUNKS_DIR / f"pdf_{i}_chunk_{c}.txt").read_text(encoding="utf-8")
+            (analysis_utils.CHUNKS_DIR / f"pdf_{i}_chunk_{c}.txt").read_text(encoding="utf-8")
             for c in range(num_chunks)
         ]
         aggregate_chunks(client, i, chunk_results, pdf_path.name, pages_label,

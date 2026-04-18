@@ -22,7 +22,8 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from analysis_utils import INVESTIGATION_ITEMS, RESULTS_DIR
+import analysis_utils
+from analysis_utils import INVESTIGATION_ITEMS
 
 
 THIN = "─" * 80
@@ -121,16 +122,24 @@ def build_report(by_section: dict[int, list[dict]], source_files: list[Path]) ->
 
 
 def discover_result_files() -> list[Path]:
-    files = sorted(RESULTS_DIR.glob('pdf_*.txt')) + sorted(RESULTS_DIR.glob('file_*.txt'))
+    files = sorted(analysis_utils.RESULTS_DIR.glob('pdf_*.txt')) + sorted(analysis_utils.RESULTS_DIR.glob('file_*.txt'))
     return [f for f in files if f.is_file()]
 
 
 def main():
     parser = argparse.ArgumentParser(description='Phase 2: merge Phase 1 result files into final report (no LLM).')
     parser.add_argument('files', nargs='*', type=Path, help='Result files to merge (default: auto-discover)')
-    parser.add_argument('--output', type=Path, default=RESULTS_DIR / 'final_report.txt',
-                        help='Output path (default: results/final_report.txt)')
+    parser.add_argument('--output', type=Path, default=None,
+                        help='Output path (default: <project-dir>/final_report.txt)')
+    parser.add_argument('--input-dir', default=None, metavar='DIR',
+                        help='Folder containing input PDFs (used to resolve defaults).')
+    parser.add_argument('--project-dir', default=None, metavar='DIR',
+                        help='Folder for all outputs (default: <script-dir>/results).')
     args = parser.parse_args()
+
+    analysis_utils.configure_paths(args.input_dir, args.project_dir)
+    if args.output is None:
+        args.output = analysis_utils.RESULTS_DIR / 'final_report.txt'
 
     if args.files:
         source_files = args.files
@@ -141,7 +150,7 @@ def main():
     else:
         source_files = discover_result_files()
         if not source_files:
-            print('ERROR: No result files found in results/. Run python3 analyze_phase1.py first.')
+            print(f'ERROR: No result files found in {analysis_utils.RESULTS_DIR}. Run python3 analyze_phase1.py first.')
             sys.exit(1)
         print(f'Auto-discovered {len(source_files)} result file(s): {", ".join(f.name for f in source_files)}')
 

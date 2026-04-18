@@ -32,13 +32,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import analysis_utils
 from analysis_utils import (
-    BASE_DIR, PDF_FILES, RESULTS_DIR, CHUNKS_DIR, EXTRACTED_DIR,
     SYSTEM_PROMPT, INVESTIGATION_ITEMS,
     extract_text, count_pages, call_claude_streaming, log,
     metrics, reset_metrics, _PAGE_MARKER_RE, _slice_pages,
 )
-from estimate import estimate_pdf, fmt_time, CHUNK_MAX_OUT_TOK, AGG_MAX_OUT_TOK, OUTPUT_TOK_PER_MIN
+from estimate import estimate_pdf, fmt_time, CHUNK_AVG_OUT_TOK, AGG_AVG_OUT_TOK, OUTPUT_TOK_PER_MIN
 import anthropic
 
 DEFAULT_BATCH_SIZE = 5  # pages per chunk — small chunks finish fast and don't truncate
@@ -54,7 +54,7 @@ def process_chunk(
     total_pages: int,
     skip_cache: bool = False,
 ) -> str:
-    chunk_file = CHUNKS_DIR / f"pdf_{pdf_index}_chunk_{chunk_index}.txt"
+    chunk_file = analysis_utils.CHUNKS_DIR / f"pdf_{pdf_index}_chunk_{chunk_index}.txt"
 
     if not skip_cache and chunk_file.exists():
         log(f"  [skip] chunk {chunk_index} (pages {start_page+1}–{end_page}) — already done")
@@ -96,7 +96,7 @@ def aggregate_chunks(
     skip_cache: bool = False,
     result_file: Path | None = None,
 ) -> str:
-    pdf_result_file = result_file or RESULTS_DIR / f"pdf_{pdf_index}.txt"
+    pdf_result_file = result_file or analysis_utils.RESULTS_DIR / f"pdf_{pdf_index}.txt"
 
     if not skip_cache and pdf_result_file.exists():
         log(f"  [skip] {pdf_result_file.name} — already aggregated")
@@ -187,7 +187,7 @@ def process_text_file(
     def _run_chunk(chunk_idx: int) -> tuple[int, str]:
         start = chunk_idx * batch_size
         end = min(start + batch_size, pages_to_process)
-        chunk_file = CHUNKS_DIR / f"file_{stem}_chunk_{chunk_idx}.txt"
+        chunk_file = analysis_utils.CHUNKS_DIR / f"file_{stem}_chunk_{chunk_idx}.txt"
 
         if not skip_cache and chunk_file.exists():
             log(f"  [skip] chunk {chunk_idx} (pages {start+1}–{end}) — already done")
@@ -227,7 +227,7 @@ def process_text_file(
             chunk_results_map[idx] = result
     chunk_results = [chunk_results_map[i] for i in range(num_chunks)]
 
-    result_file = RESULTS_DIR / f"file_{stem}.txt"
+    result_file = analysis_utils.RESULTS_DIR / f"file_{stem}.txt"
     aggregated = aggregate_chunks(
         client, f"file_{stem}", chunk_results,
         pdf_name=file_path.name,
@@ -247,7 +247,7 @@ def process_pdf(
     workers: int = 1,
 ) -> tuple[str, str, str]:
     """Process one PDF. Returns (pdf_name, pages_label, aggregated_result)."""
-    pdf_path = PDF_FILES[pdf_index]
+    pdf_path = analysis_utils.PDF_FILES[pdf_index]
     skip_cache = max_pages is not None
 
     total_pages = count_pages(pdf_path)
@@ -255,7 +255,7 @@ def process_pdf(
     num_chunks = (pages_to_process + batch_size - 1) // batch_size
     pages_label = f"עמודים 1–{pages_to_process} (מתוך {total_pages})" if max_pages else f"כל {total_pages} עמודים"
 
-    txt_file = EXTRACTED_DIR / f"{pdf_path.stem}.txt"
+    txt_file = analysis_utils.EXTRACTED_DIR / f"{pdf_path.stem}.txt"
     txt_kb = txt_file.stat().st_size // 1024 if txt_file.exists() else 0
 
     log(f"\n{'='*50}")
@@ -312,24 +312,34 @@ def main():
     )
     parser.add_argument(
         "-w", "--workers", type=int, default=2, metavar="N",
-        help="Parallel chunk workers per PDF (default: 2, max: 3).",
+        help="Parallel chunk workers per PDF (default: 2, max: 10).",
+    )
+    parser.add_argument(
+        "--input-dir", default=None, metavar="DIR",
+        help="Folder containing input PDFs and extracted/ subdir (default: script dir).",
+    )
+    parser.add_argument(
+        "--project-dir", default=None, metavar="DIR",
+        help="Folder for all outputs: chunks, results, run.log (default: <script-dir>/results).",
     )
     args = parser.parse_args()
+
+    analysis_utils.configure_paths(args.input_dir, args.project_dir)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY not set.\nRun: export ANTHROPIC_API_KEY=sk-ant-...", file=sys.stderr)
         sys.exit(1)
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    CHUNKS_DIR.mkdir(exist_ok=True)
+    analysis_utils.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    analysis_utils.CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Resolve --file paths
     file_paths: list[Path] = []
     for f in args.files:
         p = Path(f)
         if not p.is_absolute():
-            p = BASE_DIR / p
+            p = analysis_utils.BASE_DIR / p
         if not p.exists():
             print(f"ERROR: file not found: {p}", file=sys.stderr)
             sys.exit(1)
@@ -339,11 +349,11 @@ def main():
     if file_paths and not args.pdfs:
         indices = []
     else:
-        indices = args.pdfs if args.pdfs else list(range(len(PDF_FILES)))
+        indices = args.pdfs if args.pdfs else list(range(len(analysis_utils.PDF_FILES)))
 
-    invalid = [i for i in indices if i < 0 or i >= len(PDF_FILES)]
+    invalid = [i for i in indices if i < 0 or i >= len(analysis_utils.PDF_FILES)]
     if invalid:
-        print(f"Invalid PDF indices: {invalid}. Valid range: 0–{len(PDF_FILES)-1}", file=sys.stderr)
+        print(f"Invalid PDF indices: {invalid}. Valid range: 0–{len(analysis_utils.PDF_FILES)-1}", file=sys.stderr)
         sys.exit(1)
 
     if not indices and not file_paths:
@@ -352,7 +362,7 @@ def main():
 
     batch_size = args.chunk_size
     max_pages = args.max_pages
-    workers = min(max(1, args.workers), 3)
+    workers = min(max(1, args.workers), 10)
     run_time = datetime.datetime.now()
     reset_metrics()
     client = anthropic.Anthropic(api_key=api_key, timeout=anthropic.Timeout(connect=30.0, read=1800.0, write=30.0, pool=30.0))
@@ -362,7 +372,7 @@ def main():
 
     # ── Pre-run estimate (PDFs only) ──────────────────────────────────────────
     if indices:
-        estimates = [estimate_pdf(PDF_FILES[i], batch_size, max_pages) for i in indices]
+        estimates = [estimate_pdf(analysis_utils.PDF_FILES[i], batch_size, max_pages) for i in indices]
         total_calls = sum(e["calls"] for e in estimates if "error" not in e)
         total_min   = sum(e["est_min"] for e in estimates if "error" not in e)
         total_cost  = sum(e["cost"] for e in estimates if "error" not in e)
@@ -401,7 +411,7 @@ def main():
     report = header + "\n" + metrics_block + "\n\n" + body
 
     ts = run_time.strftime("%Y%m%d_%H%M%S")
-    report_path = RESULTS_DIR / f"report_{ts}.txt"
+    report_path = analysis_utils.RESULTS_DIR / f"report_{ts}.txt"
     report_path.write_text(report, encoding="utf-8")
 
     log(f"\n{'='*50}")

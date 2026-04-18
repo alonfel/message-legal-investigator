@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from analysis_utils import EXTRACTED_DIR, INVESTIGATION_ITEMS, RESULTS_DIR, _PAGE_MARKER_RE, _slice_pages
+import analysis_utils
+from analysis_utils import INVESTIGATION_ITEMS, _PAGE_MARKER_RE, _slice_pages
 
 THIN = "─" * 80
 SEP  = "=" * 80
@@ -123,7 +124,7 @@ _extracted_cache: dict[str, str | None] = {}
 
 def _load_extracted(pdf_name: str) -> str | None:
     if pdf_name not in _extracted_cache:
-        path = EXTRACTED_DIR / pdf_name.replace(".pdf", ".txt")
+        path = analysis_utils.EXTRACTED_DIR / pdf_name.replace(".pdf", ".txt")
         _extracted_cache[pdf_name] = path.read_text(encoding="utf-8") if path.exists() else None
     return _extracted_cache[pdf_name]
 
@@ -292,14 +293,21 @@ def main() -> None:
                         help="Check each citation exists in the source extracted text")
     parser.add_argument("--enrich", action="store_true",
                         help="Add surrounding conversation context below each citation")
-    parser.add_argument("--input", type=Path,
-                        default=RESULTS_DIR / "final_report.txt",
-                        help="Input report (default: results/final_report.txt)")
+    parser.add_argument("--input", type=Path, default=None,
+                        help="Input report (default: <project-dir>/final_report.txt)")
     parser.add_argument("--output", type=Path,
                         help="Output file path (default: auto-named)")
     parser.add_argument("--context-lines", type=int, default=40, metavar="N",
                         help="Max lines of context per citation when --enrich is set (default: 40)")
+    parser.add_argument("--input-dir", default=None, metavar="DIR",
+                        help="Folder containing input PDFs and extracted/ subdir.")
+    parser.add_argument("--project-dir", default=None, metavar="DIR",
+                        help="Folder for all outputs (default: <script-dir>/results).")
     args = parser.parse_args()
+
+    analysis_utils.configure_paths(args.input_dir, args.project_dir)
+    if args.input is None:
+        args.input = analysis_utils.RESULTS_DIR / "final_report.txt"
 
     if not args.verify and not args.enrich:
         print("No mode selected — use --verify and/or --enrich.")
@@ -315,7 +323,7 @@ def main() -> None:
             "verified" if args.verify else "",
             "enriched" if args.enrich else "",
         ]))
-        args.output = RESULTS_DIR / f"phase3_{suffix}_report.txt"
+        args.output = analysis_utils.RESULTS_DIR / f"phase3_{suffix}_report.txt"
 
     mode_label = " + ".join(filter(None, [
         "Verification" if args.verify else "",
@@ -353,7 +361,7 @@ def main() -> None:
             if f.status in (STATUS_NOT_FOUND, STATUS_NO_SOURCE)
         ]
         if flagged:
-            issues_path = RESULTS_DIR / "verification_issues.txt"
+            issues_path = analysis_utils.RESULTS_DIR / "verification_issues.txt"
             issue_lines = [f"ציטוטים שלא אומתו ({len(flagged)}):\n"]
             for sec, f in flagged:
                 issue_lines.append(f"[סעיף {sec.num}] {f.raw}")

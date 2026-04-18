@@ -13,6 +13,18 @@ RESULTS_DIR = BASE_DIR / "results"
 CHUNKS_DIR = RESULTS_DIR / "chunks"
 EXTRACTED_DIR = BASE_DIR / "extracted"  # pre-extracted plain-text files
 
+
+def configure_paths(input_dir=None, project_dir=None) -> None:
+    """Override default input/output directories. Call before any I/O in main()."""
+    global PDF_FILES, EXTRACTED_DIR, RESULTS_DIR, CHUNKS_DIR, LOG_FILE
+    inp = Path(input_dir) if input_dir else BASE_DIR
+    prj = Path(project_dir) if project_dir else BASE_DIR / "results"
+    PDF_FILES = [inp / f"yoni-meital{i}.pdf" for i in range(7)]
+    EXTRACTED_DIR = inp / "extracted"
+    RESULTS_DIR = prj
+    CHUNKS_DIR = prj / "chunks"
+    LOG_FILE = prj / "run.log"
+
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """אתה מומחה לניתוח תכתובות ווטסאפ לצורך חקירה משפטית.
@@ -163,13 +175,37 @@ def extract_text(pdf_path: Path, start_page: int = 0, end_page: int | None = Non
     return _extract_text_from_pdf(pdf_path, start_page, end_page)
 
 
-LOG_FILE = BASE_DIR / "run.log"
+LOG_FILE = RESULTS_DIR / "run.log"
 
 MODEL = "claude-haiku-4-5-20251001"
 
 # Pricing for claude-haiku-4-5 ($ per million tokens)
 _PRICE_INPUT_PER_M  = 0.80
 _PRICE_OUTPUT_PER_M = 4.00
+
+# ─── Credit balance ──────────────────────────────────────────────────────────
+
+def fetch_credit_balance(api_key: str) -> str | None:
+    """Fetch remaining Anthropic credit balance. Returns None if unavailable."""
+    import httpx
+    try:
+        resp = httpx.get(
+            "https://api.anthropic.com/v1/organizations/billing/credit_balance",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for key in ("remaining_credits", "credits_remaining", "balance", "amount"):
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, (int, float)):
+                        # API returns cents or dollars — heuristic: >1000 means cents
+                        return f"${val / 100:.2f}" if val > 1000 else f"${val:.2f}"
+    except Exception:
+        pass
+    return None
+
 
 # ─── Run-level metrics accumulator ───────────────────────────────────────────
 
@@ -187,6 +223,7 @@ class RunMetrics:
         self.elapsed_seconds: float = 0.0
         self._run_start: float = time.monotonic()
         self.calls_detail: list[dict] = []
+        self._api_key: str = ""
 
     def record(self, input_tokens: int, output_tokens: int, elapsed: float, label: str = "") -> None:
         self.calls += 1
@@ -236,9 +273,10 @@ class RunMetrics:
             )
         rows.append(sep)
         m, s = divmod(int(self.total_elapsed), 60)
+        t = f"{m}m{s:02d}s" if m else f"{s}s"
         rows.append(
             f"  {'TOTAL':<{col['label']}} │ {self.input_tokens:>{col['in']},} │"
-            f" {self.output_tokens:>{col['out']},} │ {m}m{s:02d}s:>{col['time']-2} │ ${self.cost_usd:>{col['cost']-1}.4f}"
+            f" {self.output_tokens:>{col['out']},} │ {t:>{col['time']}} │ ${self.cost_usd:>{col['cost']-1}.4f}"
         )
         rows.append(sep)
         return "\n".join(rows)
@@ -246,7 +284,7 @@ class RunMetrics:
     def summary_lines(self) -> list[str]:
         total = self.total_elapsed
         m, s = divmod(int(total), 60)
-        return [
+        lines = [
             f"API calls      : {self.calls}",
             f"Input tokens   : {self.input_tokens:,}",
             f"Output tokens  : {self.output_tokens:,}",
@@ -254,6 +292,10 @@ class RunMetrics:
             f"Cost (USD)     : ${self.cost_usd:.4f}",
             f"Wall time      : {m}m {s:02d}s",
         ]
+        if self._api_key:
+            balance = fetch_credit_balance(self._api_key)
+            lines.append(f"Credits left   : {balance if balance is not None else '(unavailable)'}")
+        return lines
 
     def report_block(self) -> str:
         sep = "─" * 80
@@ -277,8 +319,32 @@ def log(msg: str) -> None:
     """Write timestamped message to both stdout and run.log."""
     line = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def _api_start(client: anthropic.Anthropic, label: str, system: str, user_message: str, max_tokens: int) -> float:
+    if not metrics._api_key:
+        metrics._api_key = client.api_key or ""
+    input_chars = len(system) + len(user_message)
+    preview = user_message[:120].replace("\n", " ").strip()
+    log(f"API call{' [' + label + ']' if label else ''} — {input_chars:,} chars (~{input_chars//2:,} tok est.)")
+    log(f"  → preview: \"{preview}...\"")
+    log(f"  → max_tokens: {max_tokens}")
+    return time.monotonic()
+
+
+def _api_end(label: str, t0: float, in_tok: int, out_tok: int, stop_reason: str) -> None:
+    elapsed = time.monotonic() - t0
+    call_cost = (in_tok / 1_000_000 * _PRICE_INPUT_PER_M +
+                 out_tok / 1_000_000 * _PRICE_OUTPUT_PER_M)
+    metrics.record(in_tok, out_tok, elapsed, label=label)
+    log(f"  ✓ {elapsed:.1f}s — in:{in_tok:,} out:{out_tok:,} tok  ${call_cost:.4f}  stop={stop_reason}")
+    log(metrics.running_total_line())
+
+
+_RATE_LIMIT_RETRY_DELAY = 60
 
 
 def call_claude(
@@ -289,31 +355,20 @@ def call_claude(
     label: str = "",
 ) -> str:
     """Single non-streaming API call. Records token usage and cost in metrics."""
-    input_chars = len(system) + len(user_message)
-    preview = user_message[:120].replace("\n", " ").strip()
-    log(f"API call{' [' + label + ']' if label else ''} — {input_chars:,} chars (~{input_chars//2:,} tok est.)")
-    log(f"  → preview: \"{preview}...\"")
-    log(f"  → max_tokens: {max_tokens}")
-
-    t0 = time.monotonic()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    elapsed = time.monotonic() - t0
-
-    in_tok  = response.usage.input_tokens
-    out_tok = response.usage.output_tokens
-    call_cost = (in_tok / 1_000_000 * _PRICE_INPUT_PER_M +
-                 out_tok / 1_000_000 * _PRICE_OUTPUT_PER_M)
-    metrics.record(in_tok, out_tok, elapsed, label=label)
-
-    result = response.content[0].text
-    log(f"  ✓ {elapsed:.1f}s — in:{in_tok:,} out:{out_tok:,} tok  ${call_cost:.4f}  stop={response.stop_reason}")
-    log(metrics.running_total_line())
-    return result
+    while True:
+        try:
+            t0 = _api_start(client, label, system, user_message, max_tokens)
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            _api_end(label, t0, response.usage.input_tokens, response.usage.output_tokens, response.stop_reason)
+            return response.content[0].text
+        except anthropic.RateLimitError as e:
+            log(f"Rate limit hit{f' [{label}]' if label else ''}: {e}. Retrying in {_RATE_LIMIT_RETRY_DELAY}s...")
+            time.sleep(_RATE_LIMIT_RETRY_DELAY)
 
 
 def call_claude_streaming(
@@ -324,32 +379,21 @@ def call_claude_streaming(
     label: str = "",
 ) -> str:
     """Streaming API call — required when max_tokens may exceed the 10-minute SDK timeout threshold."""
-    input_chars = len(system) + len(user_message)
-    preview = user_message[:120].replace("\n", " ").strip()
-    log(f"API call{' [' + label + ']' if label else ''} — {input_chars:,} chars (~{input_chars//2:,} tok est.)")
-    log(f"  → preview: \"{preview}...\"")
-    log(f"  → max_tokens: {max_tokens}")
-
-    t0 = time.monotonic()
-    chunks: list[str] = []
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user_message}],
-    ) as stream:
-        for text in stream.text_stream:
-            chunks.append(text)
-        final = stream.get_final_message()
-    elapsed = time.monotonic() - t0
-
-    in_tok  = final.usage.input_tokens
-    out_tok = final.usage.output_tokens
-    call_cost = (in_tok / 1_000_000 * _PRICE_INPUT_PER_M +
-                 out_tok / 1_000_000 * _PRICE_OUTPUT_PER_M)
-    metrics.record(in_tok, out_tok, elapsed, label=label)
-
-    result = "".join(chunks)
-    log(f"  ✓ {elapsed:.1f}s — in:{in_tok:,} out:{out_tok:,} tok  ${call_cost:.4f}  stop={final.stop_reason}")
-    log(metrics.running_total_line())
-    return result
+    while True:
+        try:
+            t0 = _api_start(client, label, system, user_message, max_tokens)
+            chunks: list[str] = []
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            ) as stream:
+                for text in stream.text_stream:
+                    chunks.append(text)
+                final = stream.get_final_message()
+            _api_end(label, t0, final.usage.input_tokens, final.usage.output_tokens, final.stop_reason)
+            return "".join(chunks)
+        except anthropic.RateLimitError as e:
+            log(f"Rate limit hit{f' [{label}]' if label else ''}: {e}. Retrying in {_RATE_LIMIT_RETRY_DELAY}s...")
+            time.sleep(_RATE_LIMIT_RETRY_DELAY)
