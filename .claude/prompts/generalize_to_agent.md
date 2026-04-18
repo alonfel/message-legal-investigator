@@ -201,6 +201,47 @@ python3 legal_agent.py \
 
 ---
 
+## Phase C — Hybrid RAG enrichment (future, after Phase B)
+
+The current exhaustive extraction (Phase 1) is intentionally kept — for legal work, missing evidence is worse than extra cost. RAG does NOT replace Phase 1.
+
+However, RAG adds value in two specific places:
+
+**Where to add RAG:**
+
+1. **Phase 2 — Semantic deduplication**
+   Current dedup uses exact string match `(citation, date, source)`. Two findings that describe the same event with different wording are kept as duplicates. A semantic similarity check (embedding cosine distance < threshold) could catch these.
+   - New file: `embed_utils.py` — wrapper around an embedding API (OpenAI `text-embedding-3-large` or a multilingual model for Hebrew)
+   - In `analyze_phase2.py`: after exact dedup, run semantic dedup pass on remaining findings per section
+
+2. **Phase 4 — Related passage retrieval**
+   Currently narrative context is limited to the cited page. RAG can find *related* passages across the whole corpus — other messages that echo the same pattern but weren't extracted in Phase 1 (different vocabulary, implicit evidence).
+   - In `build_narrative.py`: after fetching citation context via page number, optionally run a semantic search query (the citation text as query) to retrieve 2-3 additional related passages from the full corpus
+   - Flag: `--enrich-rag` to opt in (adds latency + cost)
+
+**What NOT to do with RAG:**
+- Do not replace Phase 1 exhaustive extraction with RAG queries per item — miss rate is too high for legal use, especially in Hebrew where multilingual embeddings are weaker
+
+**New files needed:**
+| File | Purpose |
+|---|---|
+| `embed_utils.py` | Embed text, build/query local vector index (FAISS or ChromaDB) |
+| `build_index.py` | One-time script: embed all `extracted/*.txt` pages → save index to `index/` |
+
+**Verification:**
+```bash
+# Build the corpus index (one-time)
+python3 build_index.py --input-dir extracted/
+
+# Phase 2 with semantic dedup
+python3 analyze_phase2.py --semantic-dedup
+
+# Phase 4 with RAG-enriched context
+python3 build_narrative.py --sections 3,7 --narrative "..." --enrich-rag
+```
+
+---
+
 ## Design constraints to keep in mind
 
 - **Streaming is required** for Phase 1 chunk calls and Phase 4 narrative — output can be large
