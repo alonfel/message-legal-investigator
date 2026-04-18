@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project does
 
-Analyzes 7 WhatsApp conversation PDFs (`yoni-meital0.pdf` – `yoni-meital6.pdf`) against 54 Hebrew legal investigation items using Claude (Haiku 4.5). Operates as a 3-phase pipeline:
+Analyzes 7 WhatsApp conversation PDFs (`yoni-meital0.pdf` – `yoni-meital6.pdf`) against 54 Hebrew legal investigation items using Claude (Haiku 4.5). Operates as a 4-phase pipeline:
 - **Phase 1** (`analyze_phase1.py`): splits each PDF into chunks, sends each chunk to Claude, caches per-PDF findings to `results/`
 - **Phase 2** (`analyze_phase2.py`): pure text merge — deduplicates all per-PDF findings into `results/final_report.txt` (no API call)
 - **Phase 3** (`validate_report.py`): verifies citations exist in source text and/or enriches each finding with surrounding conversation context (no API call)
+- **Phase 4** (`build_narrative.py`): takes selected sections from `final_report.txt` and uses Claude to synthesize a narrative document — chronological timeline + legal argument brief
 
 Output is a structured Hebrew report with verbatim citations, timestamps, and source page references.
 
@@ -53,6 +54,13 @@ python3 validate_report.py --verify                          # check citations e
 python3 validate_report.py --enrich                          # add surrounding conversation context
 python3 validate_report.py --verify --enrich                 # both (recommended)
 python3 validate_report.py --verify --enrich --context-lines 10  # compact context blocks
+
+# 6. Phase 4 — build a narrative document around a specific legal angle (~$0.04–0.20)
+# Context is fetched live from extracted/*.txt (not final_report.txt) — requires extract_pdfs.py to have run
+python3 build_narrative.py --sections 3 --narrative "מיטל מודה בתרומת יונתן"
+python3 build_narrative.py --sections 3,7,12 --narrative "דפוס שליטה כלכלית"
+python3 build_narrative.py --sections 3,7 --narrative "..." --context-lines 10  # cheaper
+python3 build_narrative.py --sections 3,7 --narrative "..." --verified-only     # skip unverified
 ```
 
 Monitor progress live: `tail -f run.log`
@@ -81,6 +89,13 @@ Progress is saved to `results/progress.json` after each chunk — interrupting a
 3. **Phase 3** (`validate_report.py`): Post-processing on `final_report.txt`. No API call. Two independent modes:
    - `--verify`: Searches each citation's quoted text in the corresponding `extracted/*.txt` file at the stated page (±1 tolerance). Labels each finding `✓ VERIFIED`, `~ NEARBY`, `✗ NOT FOUND`, or `? NO SOURCE`. Flagged citations are written to `results/verification_issues.txt`.
    - `--enrich`: Adds a `הקשר:` block below each citation with the surrounding page text (default 40 lines, configurable with `--context-lines N`).
+
+4. **Phase 4** (`build_narrative.py`): Narrative synthesis on `final_report.txt`. Uses Claude (1 API call). Takes `--sections` (comma-separated section numbers) and `--narrative` (free-text angle in Hebrew). For each finding, fetches the full surrounding page text **live from `extracted/yoni-meitalN.txt`** (not from `final_report.txt` — the report only stores the citation, date, and page reference). This gives Claude the real WhatsApp conversation with speaker names and timestamps around each quote. Findings are sorted chronologically, then Claude produces a two-part Hebrew document:
+   - `חלק א: ציר זמן` — chronological narrative prose connecting events
+   - `חלק ב: ניתוח משפטי` — legal argument: claim → numbered evidence chain → conclusion
+
+   **Requires** `extracted/*.txt` files to exist (run `python3 extract_pdfs.py` first). Findings with no page number in their source field get no context — Claude receives only the bare citation for those.
+   Cost measured at ~$0.036 per section (19 findings, 10 context lines, Haiku 4.5). Use `--context-lines 10` for cheaper runs; default is 30.
 
 **Shared utilities** (`analysis_utils.py`):
 - `extract_text()` — serves text from `extracted/*.txt` pre-extracted files (fast), falls back to live PyMuPDF extraction. Each page is wrapped with `=== [yoni-meitalN.pdf | עמוד NN] ===` for source tracing.
@@ -118,6 +133,7 @@ Progress is saved to `results/progress.json` after each chunk — interrupting a
 | `results/phase3_verified_enriched_report.txt` | Phase 3: both verification tags and context |
 | `results/verification_issues.txt` | Citations that failed source verification |
 | `results/progress.json` | run_all.py chunk-level progress state |
+| `results/narrative_YYYYMMDD_HHMMSS.txt` | Phase 4 narrative document (timeline + legal brief) |
 | `run.log` | Timestamped execution log |
 
 ## Model and cost
