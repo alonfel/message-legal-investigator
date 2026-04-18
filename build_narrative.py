@@ -135,6 +135,14 @@ def main() -> None:
     )
     parser.add_argument("--input-dir", default=None, metavar="DIR")
     parser.add_argument("--project-dir", default=None, metavar="DIR")
+    parser.add_argument(
+        "--show-prompt", action="store_true",
+        help="Print the full system + user prompt to stdout before calling Claude",
+    )
+    parser.add_argument(
+        "--save-prompt", action="store_true",
+        help="Save the full prompt to a _prompt_TIMESTAMP.txt file alongside the narrative",
+    )
     args = parser.parse_args()
 
     configure_paths(args.input_dir, args.project_dir)
@@ -179,6 +187,11 @@ def main() -> None:
     if missing:
         print(f"WARNING: sections not found in report: {sorted(missing)}")
 
+    # Log parsed sections
+    log(f"Found {len(selected)} sections:")
+    for sec in selected:
+        log(f"  [{sec.num}] {sec.title}  ({len(sec.findings)} findings)")
+
     # Resolve source fields for all findings
     for sec in selected:
         for f in sec.findings:
@@ -186,11 +199,17 @@ def main() -> None:
 
     # Flatten findings, optionally filtering out NOT FOUND
     pairs: list[tuple[Section, Finding]] = []
+    skipped = 0
     for sec in selected:
         for f in sec.findings:
             if args.verified_only and f.status == STATUS_NOT_FOUND:
+                skipped += 1
+                log(f"  SKIP (not verified): \"{f.citation[:60]}...\"  [{f.source_raw}]")
                 continue
             pairs.append((sec, f))
+
+    if skipped:
+        log(f"Skipped {skipped} unverified findings (--verified-only)")
 
     if not pairs:
         print("No findings found in the selected sections. Exiting.")
@@ -201,11 +220,48 @@ def main() -> None:
     # Sort chronologically by date; undated findings go last
     pairs.sort(key=lambda t: (_parse_date(t[1].date) or datetime.datetime.max, t[0].num))
 
+    # Log findings in the order they will be sent to Claude
+    log("\nFindings in chronological order:")
+    for i, (sec, f) in enumerate(pairs, 1):
+        ctx_preview = ""
+        ctx = extract_context(f, max_lines=args.context_lines)
+        ctx_lines = len(ctx.splitlines()) if ctx else 0
+        ctx_preview = f"  ({ctx_lines} context lines)" if ctx_lines else "  (no context)"
+        citation_preview = f.citation[:70].replace("\n", " ")
+        if len(f.citation) > 70:
+            citation_preview += "..."
+        log(f"  [{i:2d}] {f.date or '(no date)':>18}  §{sec.num} {sec.title[:30]}  \"{citation_preview}\"{ctx_preview}")
+
+    print()
+
     # Build prompt and call Claude
     log(f"Building prompt (context_lines={args.context_lines})...")
     user_msg = _build_user_prompt(args.narrative, pairs, args.context_lines)
     prompt_chars = len(NARRATIVE_SYSTEM) + len(user_msg)
     log(f"Prompt size: {prompt_chars:,} chars (~{prompt_chars//2:,} tokens estimated)")
+    log(f"System prompt: {len(NARRATIVE_SYSTEM):,} chars  |  User message: {len(user_msg):,} chars")
+
+    if args.show_prompt:
+        print(f"\n{'='*80}")
+        print("SYSTEM PROMPT:")
+        print('─'*80)
+        print(NARRATIVE_SYSTEM)
+        print(f"\n{'='*80}")
+        print("USER MESSAGE:")
+        print('─'*80)
+        print(user_msg)
+        print(f"{'='*80}\n")
+
+    if args.save_prompt:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        prompt_path = RESULTS_DIR / f"narrative_prompt_{ts}.txt"
+        prompt_text = (
+            f"=== SYSTEM PROMPT ===\n\n{NARRATIVE_SYSTEM}\n\n"
+            f"=== USER MESSAGE ===\n\n{user_msg}\n"
+        )
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        log(f"Prompt saved to: {prompt_path}")
 
     client = anthropic.Anthropic(api_key=api_key)
     metrics._api_key = api_key
@@ -220,6 +276,15 @@ def main() -> None:
     )
 
     # Build output document
+    finding_index_lines = []
+    for i, (sec, f) in enumerate(pairs, 1):
+        citation_preview = f.citation[:80].replace("\n", " ")
+        if len(f.citation) > 80:
+            citation_preview += "..."
+        finding_index_lines.append(
+            f"  [{i:2d}] {f.date or '(no date)':>18}  §{sec.num} {sec.title[:28]}  \"{citation_preview}\""
+        )
+
     header_lines = [
         SEP,
         "מסמך נרטיבי — תכתובות ווטסאפ יונתן-מיטל",
@@ -229,6 +294,10 @@ def main() -> None:
         f"סעיפים      : {', '.join(str(n) for n in sorted(requested))}",
         f"ממצאים      : {len(pairs)}",
         f"מודל        : {MODEL}",
+        f"הקשר לממצא  : {args.context_lines} שורות",
+        THIN,
+        "ממצאים לפי סדר כרונולוגי (כפי שנשלחו ל-Claude):",
+        *finding_index_lines,
         THIN,
         "",
     ]
