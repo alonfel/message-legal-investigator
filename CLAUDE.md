@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project does
 
-Analyzes 7 WhatsApp conversation PDFs (`yoni-meital0.pdf` – `yoni-meital6.pdf`) against 54 Hebrew legal investigation items using Claude. Output is a structured Hebrew report with verbatim citations, timestamps, and source page references.
+Analyzes 7 WhatsApp conversation PDFs (`yoni-meital0.pdf` – `yoni-meital6.pdf`) against 54 Hebrew legal investigation items using Claude (Haiku 4.5). Operates as a 3-phase pipeline:
+- **Phase 1** (`analyze_phase1.py`): splits each PDF into chunks, sends each chunk to Claude, caches per-PDF findings to `results/`
+- **Phase 2** (`analyze_phase2.py`): pure text merge — deduplicates all per-PDF findings into `results/final_report.txt` (no API call)
+- **Phase 3** (`validate_report.py`): verifies citations exist in source text and/or enriches each finding with surrounding conversation context (no API call)
+
+Output is a structured Hebrew report with verbatim citations, timestamps, and source page references.
 
 ## Prerequisites
 
@@ -69,7 +74,7 @@ Progress is saved to `results/progress.json` after each chunk — interrupting a
 
 **Two-pass pipeline** (`analyze_phase1.py` → `analyze_phase2.py`):
 
-1. **Phase 1**: Each PDF is split into N-page chunks (default 5). Each chunk is sent to `claude-haiku-4-5` with all 54 investigation items. When a PDF has multiple chunks, a second aggregation call merges them. All intermediate results are cached to `results/chunks/pdf_{i}_chunk_{j}.txt` and `results/pdf_{i}.txt` — rerunning skips completed work automatically. `--max-pages` disables the cache (validation mode). Plain-text files can also be passed via `--file`. Chunk workers run in parallel threads (default 2, max 3 via `-w`).
+1. **Phase 1**: Each PDF is split into N-page chunks (default 5). Each chunk is sent to `claude-haiku-4-5` with all 54 investigation items. When a PDF has multiple chunks, a second aggregation call merges them. All intermediate results are cached to `results/chunks/pdf_{i}_chunk_{j}.txt` and `results/pdf_{i}.txt` — rerunning skips completed work automatically. `--max-pages` disables the cache (validation mode). Plain-text files can also be passed via `--file`. Chunk workers run in parallel threads (default 2, max 10 via `-w`).
 
 2. **Phase 2**: Pure text parser — reads all `results/pdf_{i}.txt` and `results/file_{stem}.txt` files, deduplicates findings by (citation, date, source), and formats them into `results/final_report.txt`. No API call is made.
 
@@ -83,10 +88,10 @@ Progress is saved to `results/progress.json` after each chunk — interrupting a
 - `call_claude()` — non-streaming API call, suitable for short outputs.
 - `call_claude_streaming()` — streaming API call used for chunk/aggregate calls where output may be large (avoids SDK timeout).
 - `fetch_credit_balance()` — fetches remaining Anthropic credit balance via API.
-- `RunMetrics` — global `metrics` singleton accumulates token counts and cost across all API calls in a run. Reset with `reset_metrics()` at script start.
+- `RunMetrics` — global `metrics` singleton accumulates token counts and cost across all API calls in a run. Reset with `reset_metrics()` at script start. Set `metrics._api_key` to display remaining credit balance in the run summary.
 - `log()` — writes timestamped lines to both stdout and `run.log`.
 
-**`estimate.py`** — zero-API-call cost/runtime estimator. Reads the pre-extracted txt files to calculate per-chunk input sizes and projects worst-case output tokens. Run before any production run.
+**`estimate.py`** — zero-API-call cost/runtime estimator. Reads the pre-extracted txt files to calculate per-chunk input sizes and projects realistic cost and runtime using measured averages from real runs (avg chunk output: ~1,300 tokens; avg aggregation output: ~8,300 tokens). Run before any production run.
 
 **`validate_quick.py`** — fastest possible smoke test (~5s). Uses a static `sample_chat.txt` snippet and only 5 of the 54 items. Requires `sample_chat.txt` to exist in the project root. Use when iterating on prompt format changes.
 
@@ -117,4 +122,4 @@ Progress is saved to `results/progress.json` after each chunk — interrupting a
 
 ## Model and cost
 
-All analysis uses `claude-haiku-4-5-20251001`. Pricing constants in `analysis_utils.py`: `$0.80/M` input, `$4.00/M` output. Cost is tracked per-call and displayed in the run summary. Claude output speed (~2,750 tok/min measured) is the bottleneck — each chunk call can take up to ~12m, each aggregate call up to ~12m.
+All analysis uses `claude-haiku-4-5-20251001`. Pricing constants in `analysis_utils.py`: `$0.80/M` input, `$4.00/M` output. Cost is tracked per-call and displayed in the run summary. Claude output speed (~3,200 tok/min measured, Haiku 4.5 calibration) is the bottleneck — each chunk call can take up to ~12m, each aggregate call up to ~12m.
